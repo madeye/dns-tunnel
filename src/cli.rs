@@ -19,6 +19,21 @@ pub struct Config {
     pub insecure: bool,
     pub cert: Option<PathBuf>,
     pub key: Option<PathBuf>,
+    pub acme: Option<AcmeConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcmeConfig {
+    /// Contact email(s), comma-separated.
+    pub contact: String,
+    /// Domain(s) to request, comma-separated.
+    pub domains: Vec<String>,
+    /// Cert + account cache directory.
+    pub cache_dir: PathBuf,
+    /// Use Let's Encrypt staging instead of production.
+    pub staging: bool,
+    /// TCP port to bind for TLS-ALPN-01 challenges (default 443).
+    pub tls_port: u16,
 }
 
 impl Config {
@@ -34,6 +49,11 @@ impl Config {
     ///   insecure             (skip TLS verification, client only)
     ///   cert=<pem>           (server only)
     ///   key=<pem>            (server only)
+    ///   acme=<email>         (server only; enables Let's Encrypt auto-cert via TLS-ALPN-01)
+    ///   acme-domain=<host>   (server only; default: sni; comma-separated for SAN)
+    ///   acme-dir=<path>      (server only; cache dir; default: ./acme-cache)
+    ///   acme-staging         (server only; use LE staging directory)
+    ///   acme-tls-port=<n>    (server only; TCP port for TLS-ALPN-01; default 443)
     pub fn from_env_and_args() -> Result<Self> {
         let remote_host = env_required("SS_REMOTE_HOST")?;
         let remote_port: u16 = env_required("SS_REMOTE_PORT")?
@@ -63,8 +83,45 @@ impl Config {
         let cert = opts.get("cert").map(PathBuf::from);
         let key = opts.get("key").map(PathBuf::from);
 
-        if mode == Mode::Server && (cert.is_none() || key.is_none()) {
-            tracing::warn!("server mode without cert=/key=, generating ephemeral self-signed cert for sni={sni}");
+        let acme = if let Some(email) = opts.get("acme") {
+            let domains = opts
+                .get("acme-domain")
+                .cloned()
+                .unwrap_or_else(|| sni.clone())
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect::<Vec<_>>();
+            if domains.is_empty() {
+                bail!("acme= requires a non-empty domain (acme-domain= or sni=)");
+            }
+            let cache_dir = opts
+                .get("acme-dir")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("acme-cache"));
+            let staging = opts.contains_key("acme-staging");
+            let tls_port = opts
+                .get("acme-tls-port")
+                .map(|s| s.parse::<u16>())
+                .transpose()
+                .context("acme-tls-port")?
+                .unwrap_or(443);
+            Some(AcmeConfig {
+                contact: email.clone(),
+                domains,
+                cache_dir,
+                staging,
+                tls_port,
+            })
+        } else {
+            None
+        };
+
+        if mode == Mode::Server && cert.is_none() && key.is_none() && acme.is_none() {
+            tracing::warn!(
+                "server mode without cert=/key= or acme=; generating ephemeral self-signed cert for sni={sni}"
+            );
         }
 
         Ok(Self {
@@ -76,6 +133,7 @@ impl Config {
             insecure,
             cert,
             key,
+            acme,
         })
     }
 }

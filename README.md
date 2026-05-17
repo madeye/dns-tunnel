@@ -40,6 +40,30 @@ Recognized plugin options:
 | `insecure`| skip TLS verification (client only, dev/test only)   | off              |
 | `cert`    | PEM cert chain (server only; ephemeral if omitted)   | —                |
 | `key`     | PEM private key (server only)                        | —                |
+| `acme`            | contact email; enables Let's Encrypt auto-cert (TLS-ALPN-01) | —          |
+| `acme-domain`     | domain(s) to request, comma-separated SAN list               | `sni`      |
+| `acme-dir`        | cache dir for account + cert (must be writable)              | `acme-cache` |
+| `acme-staging`    | use Let's Encrypt staging (presence flag)                    | off        |
+| `acme-tls-port`   | TCP port for TLS-ALPN-01 challenges                          | `443`      |
+
+When `acme=` is set, `cert`/`key` are ignored. The plugin binds a TCP listener
+on `acme-tls-port` purely to satisfy the TLS-ALPN-01 challenge — real traffic
+still flows over UDP/QUIC on `SS_REMOTE_PORT`. For Let's Encrypt this means
+`acme-tls-port=443` and your QUIC listener (`SS_REMOTE_PORT=443`) coexist on
+the same port number (TCP vs UDP).
+
+### Server config with ACME
+
+```json
+{
+  "server": "0.0.0.0",
+  "server_port": 443,
+  "password": "secret",
+  "method": "chacha20-ietf-poly1305",
+  "plugin": "dns-tunnel",
+  "plugin_opts": "mode=server;sni=your.server.example;acme=ops@your.server.example;acme-dir=/var/lib/dns-tunnel/acme"
+}
+```
 
 ### shadowsocks-rust example
 

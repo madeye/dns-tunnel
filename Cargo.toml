@@ -29,6 +29,8 @@ thiserror = "2"
 rand = "0.8"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
+rustls-acme = { version = "0.15", default-features = false, features = ["ring", "tokio", "webpki-roots"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [profile.release]
 lto = "thin"
