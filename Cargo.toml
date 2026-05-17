@@ -22,6 +22,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 rand = "0.8"
+futures = "0.3"
+rustls-acme = { version = "0.15", default-features = false, features = ["ring", "tokio", "webpki-roots"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [dev-dependencies]
 serde_json = "1"

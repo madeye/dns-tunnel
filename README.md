@@ -70,6 +70,17 @@ Recognized plugin options:
 | `insecure`| skip TLS verification (client only, dev/test only)   | off              |
 | `cert`    | PEM cert chain (server only; ephemeral if omitted)   | —                |
 | `key`     | PEM private key (server only)                        | —                |
+| `acme`          | contact email; enables Let's Encrypt auto-cert (TLS-ALPN-01) | —          |
+| `acme-domain`   | comma-separated SAN list                                    | `sni`       |
+| `acme-dir`      | account+cert cache directory                                | `acme-cache`|
+| `acme-staging`  | use Let's Encrypt staging (presence flag)                   | off         |
+| `acme-tls-port` | TCP port for TLS-ALPN-01 challenges                         | `443`       |
+
+When `acme=` is set, `cert`/`key` are ignored. The plugin binds a TCP
+listener on `acme-tls-port` purely to satisfy the TLS-ALPN-01 challenge —
+real traffic still flows over UDP/QUIC on `SS_REMOTE_PORT`. For Let's
+Encrypt this means `acme-tls-port=443` and your QUIC listener
+(`SS_REMOTE_PORT=443`) coexist on the same port number (TCP vs UDP).
 | `decoy`             | enable decoy DoQ traffic to public resolvers (client only) | off                                                  |
 | `decoy-resolvers`   | comma-separated `host:port` list (client only)             | `dns.adguard-dns.com:853,dns.quad9.net:853`          |
 | `decoy-interval-ms` | mean sleep between queries per resolver task, jittered ±50% | `5000`                                              |

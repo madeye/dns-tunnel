@@ -27,7 +27,19 @@ struct Session {
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
-    let crypto = tls::server_config(cfg.cert.as_deref(), cfg.key.as_deref(), &cfg.sni)?;
+    let crypto = match &cfg.acme {
+        Some(acme) => {
+            tracing::info!(
+                domains = ?acme.domains,
+                staging = acme.staging,
+                cache = %acme.cache_dir.display(),
+                tls_port = acme.tls_port,
+                "ACME enabled (Let's Encrypt, TLS-ALPN-01)"
+            );
+            tls::acme_server_config(acme)?
+        }
+        None => tls::server_config(cfg.cert.as_deref(), cfg.key.as_deref(), &cfg.sni)?,
+    };
     let qcfg: quinn::crypto::rustls::QuicServerConfig = crypto
         .try_into()
         .map_err(|e| anyhow!("rustls→quic server config: {e}"))?;

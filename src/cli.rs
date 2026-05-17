@@ -18,7 +18,23 @@ pub struct Config {
     pub insecure: bool,
     pub cert: Option<PathBuf>,
     pub key: Option<PathBuf>,
+    pub acme: Option<AcmeConfig>,
     pub decoy: Option<DecoyConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcmeConfig {
+    /// Contact email used in the ACME account.
+    pub contact: String,
+    /// Domains requested on the certificate (SAN list).
+    pub domains: Vec<String>,
+    /// Persistent account+cert cache directory.
+    pub cache_dir: PathBuf,
+    /// Use Let's Encrypt staging directory instead of production.
+    pub staging: bool,
+    /// TCP port to bind for TLS-ALPN-01 challenges. Real traffic still flows
+    /// over UDP/QUIC on `SS_REMOTE_PORT`; this is purely for the challenge.
+    pub tls_port: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +61,11 @@ impl Config {
     ///   insecure             (skip TLS verification, client only)
     ///   cert=<pem>           (server only)
     ///   key=<pem>            (server only)
+    ///   acme=<email>         (server only; enables Let's Encrypt via TLS-ALPN-01)
+    ///   acme-domain=<host>   (server only; comma-separated SAN list; default: sni)
+    ///   acme-dir=<path>      (server only; account+cert cache; default: acme-cache)
+    ///   acme-staging         (server only; use LE staging directory)
+    ///   acme-tls-port=<n>    (server only; TCP port for the challenge; default 443)
     ///   decoy                (client only; enable decoy DoQ traffic to public resolvers)
     ///   decoy-resolvers=     (client only; `host:port,host:port,...`; default AdGuard+Quad9)
     ///   decoy-interval-ms=   (client only; mean interval per resolver; default 5000)
@@ -74,9 +95,48 @@ impl Config {
         let cert = opts.get("cert").map(PathBuf::from);
         let key = opts.get("key").map(PathBuf::from);
 
-        if mode == Mode::Server && (cert.is_none() || key.is_none()) {
+        let acme = if mode == Mode::Server {
+            if let Some(email) = opts.get("acme") {
+                let domains = opts
+                    .get("acme-domain")
+                    .cloned()
+                    .unwrap_or_else(|| sni.clone())
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect::<Vec<_>>();
+                if domains.is_empty() {
+                    bail!("acme= requires a non-empty domain (acme-domain= or sni=)");
+                }
+                let cache_dir = opts
+                    .get("acme-dir")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("acme-cache"));
+                let staging = opts.contains_key("acme-staging");
+                let tls_port = opts
+                    .get("acme-tls-port")
+                    .map(|s| s.parse::<u16>())
+                    .transpose()
+                    .context("acme-tls-port")?
+                    .unwrap_or(443);
+                Some(AcmeConfig {
+                    contact: email.clone(),
+                    domains,
+                    cache_dir,
+                    staging,
+                    tls_port,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if mode == Mode::Server && cert.is_none() && key.is_none() && acme.is_none() {
             tracing::warn!(
-                "server mode without cert=/key=; generating ephemeral self-signed cert for sni={sni}"
+                "server mode without cert=/key= or acme=; generating ephemeral self-signed cert for sni={sni}"
             );
         }
 
@@ -131,6 +191,7 @@ impl Config {
             insecure,
             cert,
             key,
+            acme,
             decoy,
         })
     }

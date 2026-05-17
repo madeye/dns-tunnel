@@ -28,15 +28,28 @@ reads its configuration from environment variables set by `sslocal` /
 
 ### Server-only
 
-| Key   | Default                | Meaning                                                |
-| ----- | ---------------------- | ------------------------------------------------------ |
-| `cert`| —                      | PEM-encoded certificate chain                          |
-| `key` | —                      | PEM-encoded private key                                |
+| Key             | Default      | Meaning                                                          |
+| --------------- | ------------ | ---------------------------------------------------------------- |
+| `cert`          | —            | PEM-encoded certificate chain                                    |
+| `key`           | —            | PEM-encoded private key                                          |
+| `acme`          | —            | Contact email; enables Let's Encrypt auto-cert (TLS-ALPN-01)     |
+| `acme-domain`   | `sni`        | Comma-separated SAN list                                         |
+| `acme-dir`      | `acme-cache` | Account + certificate cache directory (must be writable)         |
+| `acme-staging`  | off          | Use Let's Encrypt staging directory (presence flag)              |
+| `acme-tls-port` | `443`        | TCP port to bind for the TLS-ALPN-01 challenge                   |
 
-If `cert` / `key` are omitted, the server generates an ephemeral self-signed
-certificate for `sni` on startup — useful for local testing, **never for
-production**. For production set both, point them at a real cert (e.g. issued
-by Let's Encrypt or your own CA), and restart on rotation.
+Certificate options resolve in priority order:
+
+1. **`acme=` set** — ignore `cert`/`key`; provision and renew via Let's
+   Encrypt automatically. Binds an extra TCP listener on `acme-tls-port`
+   purely to serve the `acme-tls/1` challenge handshake; QUIC traffic still
+   uses the UDP socket on `SS_REMOTE_PORT`. Account state and the issued
+   cert persist in `acme-dir` across restarts — back it up.
+2. **`cert` + `key` set** — load that static PEM pair on startup. Restart on
+   rotation.
+3. **Neither set** — an ephemeral self-signed certificate for `sni` is
+   generated each time the process starts. **Useful for local testing only;
+   never for production.**
 
 ### Client-only
 
