@@ -1,5 +1,10 @@
 # dns-tunnel
 
+[![CI](https://github.com/madeye/dns-tunnel/actions/workflows/ci.yml/badge.svg)](https://github.com/madeye/dns-tunnel/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+Project site: <https://madeye.github.io/dns-tunnel/>
+
 A [SIP003](https://shadowsocks.org/doc/sip003.html) Shadowsocks plugin written
 in Rust that obfuscates SS traffic as a stream of DNS query / response messages
 on top of **DNS-over-QUIC** ([RFC 9250](https://www.rfc-editor.org/rfc/rfc9250)).
