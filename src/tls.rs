@@ -1,14 +1,10 @@
-use crate::cli::AcmeConfig;
 use anyhow::{Context, Result};
-use futures::StreamExt;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::ResolvesServerCert;
-use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::net::TcpListener;
 
-pub const ALPN_H3: &[u8] = b"h3";
+/// ALPN for DNS-over-QUIC (RFC 9250 §4.1.1).
+pub const ALPN_DOQ: &[u8] = b"doq";
 
 pub fn client_config(insecure: bool) -> Result<rustls::ClientConfig> {
     let mut cfg = if insecure {
@@ -23,7 +19,7 @@ pub fn client_config(insecure: bool) -> Result<rustls::ClientConfig> {
             .with_root_certificates(roots)
             .with_no_client_auth()
     };
-    cfg.alpn_protocols = vec![ALPN_H3.to_vec()];
+    cfg.alpn_protocols = vec![ALPN_DOQ.to_vec()];
     cfg.enable_early_data = false;
     Ok(cfg)
 }
@@ -41,89 +37,7 @@ pub fn server_config(
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("rustls server config")?;
-    cfg.alpn_protocols = vec![ALPN_H3.to_vec()];
-    cfg.max_early_data_size = 0;
-    Ok(cfg)
-}
-
-/// Build a `rustls::ServerConfig` whose certificate is provisioned and renewed
-/// via ACME (Let's Encrypt) using the TLS-ALPN-01 challenge type.
-///
-/// Spawns two background tasks:
-///   * the ACME state machine (polls the CA, renews ~30d before expiry); and
-///   * a TCP listener on `acme.tls_port` that handles `acme-tls/1` ALPN
-///     challenge connections via the same resolver. Other connections are
-///     accepted as HTTPS and then immediately dropped (this listener exists
-///     solely to satisfy the challenge — real traffic goes over UDP/QUIC).
-pub fn acme_server_config(acme: &AcmeConfig) -> Result<rustls::ServerConfig> {
-    std::fs::create_dir_all(&acme.cache_dir)
-        .with_context(|| format!("creating acme cache dir {}", acme.cache_dir.display()))?;
-
-    let mut state = rustls_acme::AcmeConfig::new(acme.domains.clone())
-        .contact_push(format!("mailto:{}", acme.contact))
-        .cache(rustls_acme::caches::DirCache::new(acme.cache_dir.clone()))
-        .directory_lets_encrypt(!acme.staging)
-        .state();
-    let resolver: Arc<dyn ResolvesServerCert> = state.resolver();
-    #[allow(deprecated)]
-    let acceptor = state.acceptor();
-
-    // ACME state driver — polls the CA, performs orders, renews ~30d before expiry.
-    tokio::spawn(async move {
-        while let Some(event) = state.next().await {
-            match event {
-                Ok(ok) => tracing::info!(?ok, "acme event"),
-                Err(err) => tracing::warn!(%err, "acme error"),
-            }
-        }
-    });
-
-    // TLS-ALPN-01 challenge listener (TCP). Real shadowsocks traffic flows
-    // over UDP/QUIC; this TCP socket exists solely to satisfy ACME challenges
-    // on the same port number the CA dials.
-    let bind: SocketAddr = (Ipv4Addr::UNSPECIFIED, acme.tls_port).into();
-    let domains_dbg = acme.domains.join(",");
-    tokio::spawn(async move {
-        let listener = match TcpListener::bind(bind).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!(error=%e, addr=%bind, "failed to bind ACME challenge listener");
-                return;
-            }
-        };
-        tracing::info!(addr=%bind, domains=%domains_dbg, "ACME TLS-ALPN-01 challenge listener up");
-        loop {
-            let (stream, peer) = match listener.accept().await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error=%e, "acme listener accept");
-                    continue;
-                }
-            };
-            let acceptor = acceptor.clone();
-            tokio::spawn(async move {
-                // `acceptor.accept(stream).await` returns:
-                //   Ok(None)            -> challenge was served, stream is done
-                //   Ok(Some(_handshake))-> not a challenge; we close (no TCP service)
-                //   Err(e)              -> handshake failure
-                use tokio_util::compat::TokioAsyncReadCompatExt;
-                match acceptor.accept(stream.compat()).await {
-                    Ok(None) => {
-                        tracing::debug!(%peer, "served TLS-ALPN-01 challenge");
-                    }
-                    Ok(Some(_)) => {
-                        tracing::debug!(%peer, "dropping non-ACME TCP TLS connection");
-                    }
-                    Err(e) => tracing::debug!(error=%e, %peer, "acme accept failed"),
-                }
-            });
-        }
-    });
-
-    let mut cfg = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(resolver);
-    cfg.alpn_protocols = vec![ALPN_H3.to_vec()];
+    cfg.alpn_protocols = vec![ALPN_DOQ.to_vec()];
     cfg.max_early_data_size = 0;
     Ok(cfg)
 }

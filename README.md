@@ -2,20 +2,21 @@
 
 A [SIP003](https://shadowsocks.org/doc/sip003.html) Shadowsocks plugin written
 in Rust that obfuscates SS traffic as a stream of DNS query / response messages
-(DoH-style `application/dns-message`) tunnelled over **HTTP/3** on **QUIC**.
-
-On the wire the traffic looks like a DoH3 client speaking to a DoH3 resolver:
+on top of **DNS-over-QUIC** ([RFC 9250](https://www.rfc-editor.org/rfc/rfc9250)).
 
 ```
-Shadowsocks (TCP) <-> dns-tunnel client <-- QUIC/HTTP3 --> dns-tunnel server <-> Shadowsocks (TCP)
-                                          DNS-message body
-                                          (TXT records carrying payload)
+Shadowsocks (TCP) <-> dns-tunnel client <-- QUIC, ALPN "doq" --> dns-tunnel server <-> Shadowsocks (TCP)
+                                            [u16 len][DNS msg]…
+                                            (TXT records carrying payload)
 ```
 
-Each direction on a tunnel is a single HTTP/3 bidirectional stream
-(`POST /dns-query`) whose body is a sequence of length-prefixed DNS messages.
-Payload bytes are carried as the RDATA of a TXT record in the answer section;
-the question section uses a synthetic `t.<id>.invalid` QNAME.
+Each tunneled TCP connection becomes one QUIC bidirectional stream. Bytes are
+chunked into DNS messages whose payload sits in a TXT record's RDATA; the
+question section uses a synthetic `t.<id>.invalid` QNAME. Each message is
+prefixed with a 2-byte length, matching the DoQ stream framing.
+
+No HTTP, no application-layer framing beyond DoQ. On the wire it looks like
+a DoQ resolver speaking to a DoQ client.
 
 ## Build
 
@@ -35,35 +36,12 @@ Recognized plugin options:
 | key       | meaning                                              | default          |
 | --------- | ---------------------------------------------------- | ---------------- |
 | `mode`    | `client` or `server`                                 | `client`         |
-| `sni`     | TLS SNI / `:authority`                               | `SS_REMOTE_HOST` |
-| `path`    | request path                                         | `/dns-query`     |
+| `sni`     | TLS SNI                                              | `SS_REMOTE_HOST` |
 | `insecure`| skip TLS verification (client only, dev/test only)   | off              |
 | `cert`    | PEM cert chain (server only; ephemeral if omitted)   | —                |
 | `key`     | PEM private key (server only)                        | —                |
-| `acme`            | contact email; enables Let's Encrypt auto-cert (TLS-ALPN-01) | —          |
-| `acme-domain`     | domain(s) to request, comma-separated SAN list               | `sni`      |
-| `acme-dir`        | cache dir for account + cert (must be writable)              | `acme-cache` |
-| `acme-staging`    | use Let's Encrypt staging (presence flag)                    | off        |
-| `acme-tls-port`   | TCP port for TLS-ALPN-01 challenges                          | `443`      |
 
-When `acme=` is set, `cert`/`key` are ignored. The plugin binds a TCP listener
-on `acme-tls-port` purely to satisfy the TLS-ALPN-01 challenge — real traffic
-still flows over UDP/QUIC on `SS_REMOTE_PORT`. For Let's Encrypt this means
-`acme-tls-port=443` and your QUIC listener (`SS_REMOTE_PORT=443`) coexist on
-the same port number (TCP vs UDP).
-
-### Server config with ACME
-
-```json
-{
-  "server": "0.0.0.0",
-  "server_port": 443,
-  "password": "secret",
-  "method": "chacha20-ietf-poly1305",
-  "plugin": "dns-tunnel",
-  "plugin_opts": "mode=server;sni=your.server.example;acme=ops@your.server.example;acme-dir=/var/lib/dns-tunnel/acme"
-}
-```
+The QUIC port is `SS_REMOTE_PORT` — the IANA-assigned DoQ port is **853**.
 
 ### shadowsocks-rust example
 
@@ -72,13 +50,13 @@ Client `config.json`:
 ```json
 {
   "server": "your.server.example",
-  "server_port": 443,
+  "server_port": 853,
   "local_address": "127.0.0.1",
   "local_port": 1080,
   "password": "secret",
   "method": "chacha20-ietf-poly1305",
   "plugin": "dns-tunnel",
-  "plugin_opts": "mode=client;sni=your.server.example;path=/dns-query"
+  "plugin_opts": "mode=client;sni=your.server.example"
 }
 ```
 
@@ -87,7 +65,7 @@ Server `config.json`:
 ```json
 {
   "server": "0.0.0.0",
-  "server_port": 443,
+  "server_port": 853,
   "password": "secret",
   "method": "chacha20-ietf-poly1305",
   "plugin": "dns-tunnel",

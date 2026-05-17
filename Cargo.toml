@@ -2,7 +2,7 @@
 name = "dns-tunnel"
 version = "0.1.0"
 edition = "2021"
-description = "SIP003 Shadowsocks plugin that obfuscates traffic as DoH3 (DNS-over-HTTP/3) DNS query/response messages"
+description = "SIP003 Shadowsocks plugin that obfuscates traffic as DoQ (DNS-over-QUIC, RFC 9250) query/response messages"
 license = "MIT"
 
 [[bin]]
@@ -12,25 +12,16 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 rustls-pki-types = "1"
 rcgen = "0.13"
 webpki-roots = "0.26"
-http = "1"
 bytes = "1"
-futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
-thiserror = "2"
 rand = "0.8"
-base64 = "0.22"
-clap = { version = "4", features = ["derive", "env"] }
-rustls-acme = { version = "0.15", default-features = false, features = ["ring", "tokio", "webpki-roots"] }
-tokio-util = { version = "0.7", features = ["compat"] }
 
 [profile.release]
 lto = "thin"
