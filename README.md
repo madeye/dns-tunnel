@@ -40,6 +40,16 @@ Recognized plugin options:
 | `insecure`| skip TLS verification (client only, dev/test only)   | off              |
 | `cert`    | PEM cert chain (server only; ephemeral if omitted)   | —                |
 | `key`     | PEM private key (server only)                        | —                |
+| `decoy`             | enable decoy DoQ traffic to public resolvers (client only) | off                                                  |
+| `decoy-resolvers`   | comma-separated `host:port` list (client only)             | `dns.adguard-dns.com:853,dns.quad9.net:853`          |
+| `decoy-interval-ms` | mean sleep between queries per resolver task, jittered ±50% | `5000`                                              |
+| `decoy-domains`     | A-record query targets, comma-separated                    | `example.com,wikipedia.org,github.com,cloudflare.com,apple.com` |
+
+`decoy` makes the host look like a normal DoQ client by maintaining real
+sessions to public recursive resolvers (e.g. AdGuard, Quad9) and periodically
+issuing legitimate A-record queries; responses are discarded. The intent is
+mimicry — the real tunnel (also DoQ) blends into a population of DoQ flows
+rather than standing alone.
 
 The QUIC port is `SS_REMOTE_PORT` — the IANA-assigned DoQ port is **853**.
 

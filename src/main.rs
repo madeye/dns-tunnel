@@ -3,6 +3,7 @@ use tracing_subscriber::EnvFilter;
 
 mod cli;
 mod client;
+mod decoy;
 mod dns;
 mod server;
 mod tls;

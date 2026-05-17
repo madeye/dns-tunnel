@@ -18,6 +18,17 @@ pub async fn run(cfg: Config) -> Result<()> {
     let endpoint = build_endpoint(cfg.remote, &cfg)?;
     let pool = Arc::new(QuicConn::new(endpoint, cfg.clone()));
 
+    if let Some(decoy_cfg) = cfg.decoy.clone() {
+        tracing::info!(
+            resolvers = ?decoy_cfg.resolvers,
+            interval_ms = decoy_cfg.interval_ms,
+            "decoy traffic enabled"
+        );
+        if let Err(e) = crate::decoy::spawn(decoy_cfg) {
+            tracing::warn!(error=%e, "failed to start decoy traffic");
+        }
+    }
+
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(v) => v,

@@ -18,6 +18,19 @@ pub struct Config {
     pub insecure: bool,
     pub cert: Option<PathBuf>,
     pub key: Option<PathBuf>,
+    pub decoy: Option<DecoyConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecoyConfig {
+    /// `(sni, port)` pairs. The SNI doubles as the DNS name used for address
+    /// resolution, so use hostnames here (not IP literals).
+    pub resolvers: Vec<(String, u16)>,
+    /// Average sleep between queries per resolver task; actual sleep is
+    /// uniformly jittered in `[0.5x, 1.5x]`.
+    pub interval_ms: u64,
+    /// Pool of domains to issue real A queries for.
+    pub domains: Vec<String>,
 }
 
 impl Config {
@@ -32,6 +45,10 @@ impl Config {
     ///   insecure             (skip TLS verification, client only)
     ///   cert=<pem>           (server only)
     ///   key=<pem>            (server only)
+    ///   decoy                (client only; enable decoy DoQ traffic to public resolvers)
+    ///   decoy-resolvers=     (client only; `host:port,host:port,...`; default AdGuard+Quad9)
+    ///   decoy-interval-ms=   (client only; mean interval per resolver; default 5000)
+    ///   decoy-domains=       (client only; comma-separated A-record query targets)
     pub fn from_env_and_args() -> Result<Self> {
         let remote_host = env_required("SS_REMOTE_HOST")?;
         let remote_port: u16 = env_required("SS_REMOTE_PORT")?
@@ -63,6 +80,49 @@ impl Config {
             );
         }
 
+        let decoy = if mode == Mode::Client && opts.contains_key("decoy") {
+            let resolvers = opts
+                .get("decoy-resolvers")
+                .cloned()
+                .unwrap_or_else(|| "dns.adguard-dns.com:853,dns.quad9.net:853".into());
+            let resolvers = resolvers
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(parse_host_port)
+                .collect::<Result<Vec<_>>>()?;
+            if resolvers.is_empty() {
+                bail!("decoy-resolvers= must contain at least one host:port");
+            }
+            let interval_ms = opts
+                .get("decoy-interval-ms")
+                .map(|s| s.parse::<u64>())
+                .transpose()
+                .context("decoy-interval-ms")?
+                .unwrap_or(5000);
+            let domains = opts
+                .get("decoy-domains")
+                .cloned()
+                .unwrap_or_else(|| {
+                    "example.com,wikipedia.org,github.com,cloudflare.com,apple.com".into()
+                })
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect::<Vec<_>>();
+            if domains.is_empty() {
+                bail!("decoy-domains= must contain at least one domain");
+            }
+            Some(DecoyConfig {
+                resolvers,
+                interval_ms,
+                domains,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             mode,
             local,
@@ -71,8 +131,17 @@ impl Config {
             insecure,
             cert,
             key,
+            decoy,
         })
     }
+}
+
+fn parse_host_port(s: &str) -> Result<(String, u16)> {
+    let (host, port) = s
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("expected host:port, got {s}"))?;
+    let port: u16 = port.parse().with_context(|| format!("port in {s}"))?;
+    Ok((host.to_string(), port))
 }
 
 fn env_required(name: &str) -> Result<String> {
