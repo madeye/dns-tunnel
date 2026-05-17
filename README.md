@@ -10,13 +10,38 @@ Shadowsocks (TCP) <-> dns-tunnel client <-- QUIC, ALPN "doq" --> dns-tunnel serv
                                             (TXT records carrying payload)
 ```
 
-Each tunneled TCP connection becomes one QUIC bidirectional stream. Bytes are
-chunked into DNS messages whose payload sits in a TXT record's RDATA; the
-question section uses a synthetic `t.<id>.invalid` QNAME. Each message is
-prefixed with a 2-byte length, matching the DoQ stream framing.
+### Wire-level shape (strict-conformance mode)
 
-No HTTP, no application-layer framing beyond DoQ. On the wire it looks like
-a DoQ resolver speaking to a DoQ client.
+Each query/response pair gets its own QUIC bidirectional stream (true RFC 9250
+framing — not multi-message per stream). On the DNS layer:
+
+* **Queries** look like a browser's DNS lookup with EDNS0 padding:
+  - `ID = 0` (mandatory per RFC 9250 §4.2.1)
+  - QNAME = a short random prefix + a popular suffix from a pool
+    (`googleapis.com`, `cloudfront.net`, `akamaiedge.net`, …)
+  - QTYPE rotated among `A`, `AAAA`, `HTTPS`
+  - Additional section carries an OPT pseudo-record (RFC 6891) whose
+    OPTION-CODE is `12` (PADDING, RFC 7830). The "padding" is the actual
+    tunneled bytes — modern browsers always send DNS padding to block-align
+    queries, so this hides ~2 KB of payload per message in normal-looking
+    traffic.
+* **Responses** echo the question section verbatim and carry one answer
+  record of type `HTTPS` (`TYPE 65`); the response payload sits in the
+  SvcParams tail of the RDATA. ~3.8 KB of payload per response.
+
+### Session multiplexing
+
+Because each QUIC stream carries one query and one response, multiple
+shadowsocks TCP connections multiplexing through the tunnel need their own
+session identity. Every TCP connection gets a random `u64` session ID. Each
+DNS payload starts with `[session:u64][flags:u8][seq:u16]` so the server can
+demux. Flags carry OPEN/CLOSE half-close semantics.
+
+The client uses single-flight per session: one outstanding query at a time,
+new query opens a fresh QUIC stream. When the client has no upstream data to
+send it issues empty queries on an ~80 ms cadence so the server can drain
+downstream bytes back (the server holds empty polls for ~80–160 ms instead of
+returning an empty response immediately).
 
 ## Build
 

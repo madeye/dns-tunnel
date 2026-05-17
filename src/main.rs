@@ -5,6 +5,7 @@ mod cli;
 mod client;
 mod decoy;
 mod dns;
+mod protocol;
 mod server;
 mod tls;
 

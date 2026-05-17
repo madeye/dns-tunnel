@@ -1,13 +1,19 @@
 use crate::cli::Config;
-use crate::dns::{self, MsgKind};
+use crate::dns;
+use crate::protocol::{Frame, FLAG_CLOSE, FLAG_OPEN, HEADER_LEN};
 use crate::tls;
 use anyhow::{anyhow, bail, Context, Result};
 use quinn::{ClientConfig, Connection, Endpoint};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+
+/// Cadence at which the client polls (sends an empty query) when it has no
+/// upstream data and is waiting for downstream bytes from the server.
+const POLL_INTERVAL_MS: u64 = 80;
 
 pub async fn run(cfg: Config) -> Result<()> {
     let listener = TcpListener::bind(cfg.local)
@@ -61,7 +67,6 @@ fn build_endpoint(remote: SocketAddr, cfg: &Config) -> Result<Endpoint> {
     Ok(endpoint)
 }
 
-/// Pooled QUIC connection that reconnects on demand.
 struct QuicConn {
     endpoint: Endpoint,
     cfg: Config,
@@ -95,71 +100,126 @@ impl QuicConn {
             .endpoint
             .connect(self.cfg.remote, &self.cfg.sni)
             .context("QUIC connect()")?;
-        let conn = connecting.await.context("QUIC handshake")?;
-        Ok(conn)
+        connecting.await.context("QUIC handshake")
     }
 }
 
 async fn handle_conn(mut tcp: TcpStream, peer: SocketAddr, pool: Arc<QuicConn>) -> Result<()> {
     tcp.set_nodelay(true).ok();
+    let session: u64 = rand::random();
+    tracing::debug!(%peer, session, "tunnel open");
 
-    // Open a fresh bidi stream on the pooled QUIC connection. If open_bi fails
-    // (connection dead), invalidate and retry once.
-    let (mut send, mut recv) = match pool.get().await?.open_bi().await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error=%e, "open_bi failed, redialing");
-            *pool.inner.lock().await = None;
-            pool.get().await?.open_bi().await.context("open_bi retry")?
-        }
-    };
-
-    tracing::debug!(%peer, "tunnel open");
     let (mut tcp_r, mut tcp_w) = tcp.split();
+    let mut seq: u16 = 0;
+    let mut open_sent = false;
+    let mut upstream_eof = false;
+    let mut downstream_closed = false;
+    let max_body = dns::MAX_QUERY_PAYLOAD - HEADER_LEN;
+    let mut tcp_buf = vec![0u8; max_body];
 
-    // TCP -> QUIC: encode payload chunks as DNS queries with [u16 len] frame.
-    let up = async {
-        let mut buf = vec![0u8; dns::MAX_PAYLOAD];
-        loop {
-            let n = tcp_r.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            let dns_msg = dns::encode(MsgKind::Query, &buf[..n])?;
-            send.write_u16(dns_msg.len() as u16).await?;
-            send.write_all(&dns_msg).await?;
-        }
-        send.finish().ok();
-        Ok::<_, anyhow::Error>(())
-    };
-
-    // QUIC -> TCP: read framed DNS responses, decode, write payload to TCP.
-    let down = async {
-        loop {
-            let len = match recv.read_u16().await {
-                Ok(n) => n as usize,
-                Err(e) if is_eof(&e) => {
-                    let _ = tcp_w.shutdown().await;
-                    return Ok::<_, anyhow::Error>(());
+    while !downstream_closed {
+        // Gather upstream chunk. Fast path: try_read for data already buffered
+        // (so a sustained upload isn't paced by the poll-fallback timer). Slow
+        // path: select on a fresh read or a poll deadline.
+        let body = if upstream_eof {
+            Vec::new()
+        } else {
+            match tcp_r.try_read(&mut tcp_buf) {
+                Ok(0) => {
+                    upstream_eof = true;
+                    Vec::new()
+                }
+                Ok(n) => tcp_buf[..n].to_vec(),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::select! {
+                        r = tcp_r.read(&mut tcp_buf) => {
+                            match r {
+                                Ok(0) => { upstream_eof = true; Vec::new() }
+                                Ok(n) => tcp_buf[..n].to_vec(),
+                                Err(e) => return Err(e.into()),
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)) => Vec::new(),
+                    }
                 }
                 Err(e) => return Err(e.into()),
-            };
-            let mut msg = vec![0u8; len];
-            recv.read_exact(&mut msg).await?;
-            let (kind, payload) = dns::decode(msg.into())?;
-            if kind != MsgKind::Response {
-                bail!("expected DNS response from server, got {:?}", kind);
             }
-            if !payload.is_empty() {
-                tcp_w.write_all(&payload).await?;
-            }
-        }
-    };
+        };
 
-    let _ = tokio::try_join!(up, down);
+        let mut flags = 0u8;
+        if !open_sent {
+            flags |= FLAG_OPEN;
+            open_sent = true;
+        }
+        if upstream_eof {
+            flags |= FLAG_CLOSE;
+        }
+        let frame = Frame {
+            session,
+            flags,
+            seq,
+            body,
+        };
+        seq = seq.wrapping_add(1);
+
+        let resp_frame = match round_trip(&pool, &frame).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::debug!(error=%e, %peer, session, "round-trip failed; tearing down");
+                break;
+            }
+        };
+
+        if !resp_frame.body.is_empty() {
+            tcp_w.write_all(&resp_frame.body).await?;
+        }
+        if resp_frame.is_close() {
+            downstream_closed = true;
+        }
+        if upstream_eof && downstream_closed {
+            break;
+        }
+    }
+
+    let _ = tcp_w.shutdown().await;
     Ok(())
 }
 
-fn is_eof(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::UnexpectedEof
+async fn round_trip(pool: &Arc<QuicConn>, frame: &Frame) -> Result<Frame> {
+    let frame_bytes = frame.encode_vec();
+    let query = dns::encode_query(&frame_bytes)?;
+
+    // Try once on the cached connection; on any QUIC-level error, redial.
+    let resp = match send_recv(pool.get().await?, &query).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error=%e, "quic stream failed; redialing");
+            *pool.inner.lock().await = None;
+            send_recv(pool.get().await?, &query).await?
+        }
+    };
+    let resp_payload = dns::decode_response(resp.into())?;
+    let resp_frame = Frame::decode(&resp_payload)?;
+    if resp_frame.session != frame.session {
+        bail!(
+            "session mismatch: sent {:x} got {:x}",
+            frame.session,
+            resp_frame.session
+        );
+    }
+    Ok(resp_frame)
+}
+
+async fn send_recv(conn: Connection, query: &[u8]) -> Result<Vec<u8>> {
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
+    send.write_u16(query.len() as u16).await?;
+    send.write_all(query).await?;
+    send.finish().ok();
+    let len = recv.read_u16().await? as usize;
+    if len > 64 * 1024 {
+        bail!("absurd response length {len}");
+    }
+    let mut buf = vec![0u8; len];
+    recv.read_exact(&mut buf).await?;
+    Ok(buf)
 }
