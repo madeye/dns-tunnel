@@ -9,9 +9,19 @@ pub enum Mode {
     Server,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// DoQ-over-QUIC direct between client and server (default).
+    Quic,
+    /// Plain UDP/53 DNS through public recursive resolvers to our
+    /// authoritative-NS server (NS-tunnel mode).
+    Ns,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub mode: Mode,
+    pub transport: Transport,
     pub local: SocketAddr,
     pub remote: SocketAddr,
     pub sni: String,
@@ -20,6 +30,13 @@ pub struct Config {
     pub key: Option<PathBuf>,
     pub acme: Option<AcmeConfig>,
     pub decoy: Option<DecoyConfig>,
+    /// NS-tunnel: authoritative zone delegated to this server (e.g.
+    /// `t.example.com`). Required when `transport == Ns`.
+    pub ns_zone: Option<String>,
+    /// NS-tunnel client: recursive resolver pool (host:port).
+    pub ns_resolvers: Option<Vec<(String, u16)>>,
+    /// NS-tunnel server: UDP bind address (defaults to `remote`).
+    pub ns_bind: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +87,10 @@ impl Config {
     ///   decoy-resolvers=     (client only; `host:port,host:port,...`; default AdGuard+Quad9)
     ///   decoy-interval-ms=   (client only; mean interval per resolver; default 5000)
     ///   decoy-domains=       (client only; comma-separated A-record query targets)
+    ///   transport=quic|ns    (default: quic; ns = authoritative-NS tunnel through recursive resolvers)
+    ///   ns-zone=<zone>       (transport=ns; delegated zone, e.g. t.example.com)
+    ///   ns-resolvers=        (transport=ns client; host:port,...; default 1.1.1.1:53,8.8.8.8:53,9.9.9.9:53)
+    ///   ns-bind=host:port    (transport=ns server; UDP bind; default = SS_REMOTE_HOST:SS_REMOTE_PORT)
     pub fn from_env_and_args() -> Result<Self> {
         let remote_host = env_required("SS_REMOTE_HOST")?;
         let remote_port: u16 = env_required("SS_REMOTE_PORT")?
@@ -86,6 +107,11 @@ impl Config {
             "client" => Mode::Client,
             "server" => Mode::Server,
             other => bail!("invalid mode={other}, expected client or server"),
+        };
+        let transport = match opts.get("transport").map(String::as_str).unwrap_or("quic") {
+            "quic" => Transport::Quic,
+            "ns" => Transport::Ns,
+            other => bail!("invalid transport={other}, expected quic or ns"),
         };
 
         let remote = resolve(&remote_host, remote_port)?;
@@ -183,8 +209,38 @@ impl Config {
             None
         };
 
+        let ns_zone = opts.get("ns-zone").cloned();
+        let ns_resolvers = if mode == Mode::Client && transport == Transport::Ns {
+            let raw = opts
+                .get("ns-resolvers")
+                .cloned()
+                .unwrap_or_else(|| "1.1.1.1:53,8.8.8.8:53,9.9.9.9:53".into());
+            Some(
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(parse_host_port)
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
+        let ns_bind = if mode == Mode::Server && transport == Transport::Ns {
+            opts.get("ns-bind")
+                .map(|s| s.parse::<SocketAddr>())
+                .transpose()
+                .context("ns-bind")?
+        } else {
+            None
+        };
+
+        if transport == Transport::Ns && ns_zone.is_none() {
+            bail!("transport=ns requires ns-zone=<delegated-zone>");
+        }
+
         Ok(Self {
             mode,
+            transport,
             local,
             remote,
             sni,
@@ -193,6 +249,9 @@ impl Config {
             key,
             acme,
             decoy,
+            ns_zone,
+            ns_resolvers,
+            ns_bind,
         })
     }
 }
