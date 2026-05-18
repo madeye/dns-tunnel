@@ -5,6 +5,8 @@ mod cli;
 mod client;
 mod decoy;
 mod dns;
+mod nstun;
+mod nstun_codec;
 mod protocol;
 mod server;
 mod tls;
@@ -25,8 +27,10 @@ async fn main() -> Result<()> {
     let cfg = cli::Config::from_env_and_args()?;
     tracing::info!(mode = ?cfg.mode, local = %cfg.local, remote = %cfg.remote, "dns-tunnel starting");
 
-    match cfg.mode {
-        cli::Mode::Client => client::run(cfg).await,
-        cli::Mode::Server => server::run(cfg).await,
+    match (cfg.transport, cfg.mode) {
+        (cli::Transport::Quic, cli::Mode::Client) => client::run(cfg).await,
+        (cli::Transport::Quic, cli::Mode::Server) => server::run(cfg).await,
+        (cli::Transport::Ns, cli::Mode::Client) => nstun::run_client(cfg).await,
+        (cli::Transport::Ns, cli::Mode::Server) => nstun::run_server(cfg).await,
     }
 }
