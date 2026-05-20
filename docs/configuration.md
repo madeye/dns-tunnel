@@ -60,6 +60,16 @@ Certificate options resolve in priority order:
 | `decoy-resolvers`   | `dns.adguard-dns.com:853,dns.quad9.net:853`            | Comma-separated `host:port` list                       |
 | `decoy-interval-ms` | `5000`                                                 | Mean sleep between decoy queries, jittered ±50%        |
 | `decoy-domains`     | `example.com,wikipedia.org,github.com,cloudflare.com,apple.com` | Comma-separated A-record query targets        |
+| `ns-zone`           | —                                                      | Delegated zone for `transport=ns`                      |
+| `ns-resolvers`      | transport-specific                                    | Recursive resolver pool for `transport=ns`             |
+| `ns-resolver-transport` | `udp`                                             | Client-to-resolver hop: `udp` or `doq`                 |
+
+For `transport=ns`, UDP defaults to `SS_REMOTE_HOST:SS_REMOTE_PORT`, which
+talks directly to the authoritative NS endpoint. DoQ resolver transport does
+not have a default resolver pool; set `ns-resolvers=` explicitly.
+The NS tunnel uses printable base64 TXT responses, answers resolver
+minimization probes under `ns-zone`, and stripes client chunks round-robin
+across the resolver pool.
 
 See [Cover traffic]({{ "/cover-traffic.html" | relative_url }}) for the design
 rationale of `decoy=`.

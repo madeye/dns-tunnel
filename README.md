@@ -66,6 +66,7 @@ Recognized plugin options:
 | key       | meaning                                              | default          |
 | --------- | ---------------------------------------------------- | ---------------- |
 | `mode`    | `client` or `server`                                 | `client`         |
+| `transport` | `quic` direct DoQ tunnel or `ns` authoritative-NS tunnel | `quic` |
 | `sni`     | TLS SNI                                              | `SS_REMOTE_HOST` |
 | `insecure`| skip TLS verification (client only, dev/test only)   | off              |
 | `cert`    | PEM cert chain (server only; ephemeral if omitted)   | —                |
@@ -75,16 +76,27 @@ Recognized plugin options:
 | `acme-dir`      | account+cert cache directory                                | `acme-cache`|
 | `acme-staging`  | use Let's Encrypt staging (presence flag)                   | off         |
 | `acme-tls-port` | TCP port for TLS-ALPN-01 challenges                         | `443`       |
+| `ns-zone`       | delegated zone for `transport=ns`                          | —           |
+| `ns-resolvers`  | resolver pool for `transport=ns` client                     | UDP: `SS_REMOTE_HOST:SS_REMOTE_PORT`; DoQ: explicit value required |
+| `ns-resolver-transport` | client-to-resolver hop for `transport=ns`: `udp` or `doq` | `udp` |
+| `ns-bind`       | authoritative UDP bind for `transport=ns` server            | `SS_REMOTE_HOST:SS_REMOTE_PORT` |
+| `decoy`             | enable decoy DoQ traffic to public resolvers (client only) | off                                                  |
+| `decoy-resolvers`   | comma-separated `host:port` list (client only)             | `dns.adguard-dns.com:853,dns.quad9.net:853`          |
+| `decoy-interval-ms` | mean sleep between queries per resolver task, jittered ±50% | `5000`                                              |
+| `decoy-domains`     | A-record query targets, comma-separated                    | `example.com,wikipedia.org,github.com,cloudflare.com,apple.com` |
 
 When `acme=` is set, `cert`/`key` are ignored. The plugin binds a TCP
 listener on `acme-tls-port` purely to satisfy the TLS-ALPN-01 challenge —
 real traffic still flows over UDP/QUIC on `SS_REMOTE_PORT`. For Let's
 Encrypt this means `acme-tls-port=443` and your QUIC listener
 (`SS_REMOTE_PORT=443`) coexist on the same port number (TCP vs UDP).
-| `decoy`             | enable decoy DoQ traffic to public resolvers (client only) | off                                                  |
-| `decoy-resolvers`   | comma-separated `host:port` list (client only)             | `dns.adguard-dns.com:853,dns.quad9.net:853`          |
-| `decoy-interval-ms` | mean sleep between queries per resolver task, jittered ±50% | `5000`                                              |
-| `decoy-domains`     | A-record query targets, comma-separated                    | `example.com,wikipedia.org,github.com,cloudflare.com,apple.com` |
+
+In `transport=ns`, downstream TXT responses are printable base64 for resolver
+compatibility, the authoritative server answers NS/minimization probes under
+`ns-zone`, client chunks are striped round-robin across `ns-resolvers`, and
+`ns-resolver-transport=doq` hides the client-to-recursive-resolver hop from
+local UDP/53 observers. Public recursive resolver pools are not used by
+default; set `ns-resolvers=` explicitly when you want that path.
 
 `decoy` makes the host look like a normal DoQ client by maintaining real
 sessions to public recursive resolvers (e.g. AdGuard, Quad9) and periodically

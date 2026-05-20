@@ -32,16 +32,15 @@
 //! Question   echoes the query verbatim (compression-pointer-friendly)
 //! Answer     NAME = 0xC00C (pointer to question QNAME)
 //!            TYPE = 16 (TXT), CLASS = IN, TTL = 0 (no caching)
-//!            RDATA = concatenated <len><bytes> character-strings
-//!                    that together carry the raw payload
+//!            RDATA = concatenated printable base64 character-strings
+//!                    that together carry the payload
 //! ```
 //!
 //! ## Capacity
 //! * QNAME max 255 octets total (RFC 1035). With a 15-octet zone suffix this
 //!   leaves room for ~140 raw payload bytes per query — see `query_capacity`.
-//! * TXT RDATA is bounded by the EDNS0 advertised UDP size; we cap at 3500
-//!   payload bytes per response, split across as many 255-byte char-strings
-//!   as needed.
+//! * TXT RDATA is printable base64. Keep responses below typical recursive
+//!   UDP limits even when the echoed question name is close to 255 octets.
 
 use anyhow::{bail, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -51,13 +50,18 @@ const FLAGS_QUERY: u16 = 0x0100;
 const FLAGS_RESPONSE: u16 = 0x8180;
 const CLASS_IN: u16 = 1;
 pub const QTYPE_TXT: u16 = 16;
+pub const QTYPE_NS: u16 = 2;
 const OPT_TYPE: u16 = 41;
 
 const MAX_NAME_OCTETS: usize = 255;
 const MAX_LABEL_BYTES: usize = 63;
 
-/// Hard cap on raw payload bytes per response (TXT RDATA assembled).
-pub const MAX_RESPONSE_PAYLOAD: usize = 3500;
+/// Hard cap on raw payload bytes per response before printable TXT encoding.
+///
+/// Recursive resolvers commonly advertise/forward UDP payload sizes around
+/// 1232 bytes. Since TXT response bodies are base64 encoded and the response
+/// echoes the full QNAME, keep the raw frame comfortably below that ceiling.
+pub const MAX_RESPONSE_PAYLOAD: usize = 700;
 
 /// Lowercase RFC 4648 base32 alphabet (DNS labels are case-insensitive but
 /// many resolvers normalize to lowercase, so emit lowercase to look native).
@@ -97,6 +101,66 @@ pub fn b32_decode(input: &[u8]) -> Result<Vec<u8>> {
         if nbits >= 8 {
             nbits -= 8;
             out.push(((bits >> nbits) & 0xFF) as u8);
+        }
+    }
+    Ok(out)
+}
+
+const B64_ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+pub fn b64_encode(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(B64_ALPHA[(b0 >> 2) as usize]);
+        out.push(B64_ALPHA[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize]);
+        if chunk.len() > 1 {
+            out.push(B64_ALPHA[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize]);
+        } else {
+            out.push(b'=');
+        }
+        if chunk.len() > 2 {
+            out.push(B64_ALPHA[(b2 & 0x3f) as usize]);
+        } else {
+            out.push(b'=');
+        }
+    }
+    out
+}
+
+pub fn b64_decode(input: &[u8]) -> Result<Vec<u8>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !input.len().is_multiple_of(4) {
+        bail!("invalid base64 length {}", input.len());
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    for chunk in input.chunks(4) {
+        let mut vals = [0u8; 4];
+        let mut pad = 0usize;
+        for (i, &c) in chunk.iter().enumerate() {
+            vals[i] = match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => 26 + c - b'a',
+                b'0'..=b'9' => 52 + c - b'0',
+                b'+' => 62,
+                b'/' => 63,
+                b'=' if i >= 2 => {
+                    pad += 1;
+                    0
+                }
+                _ => bail!("invalid base64 byte 0x{c:02x}"),
+            };
+        }
+        out.push((vals[0] << 2) | (vals[1] >> 4));
+        if pad < 2 {
+            out.push((vals[1] << 4) | (vals[2] >> 2));
+        }
+        if pad < 1 {
+            out.push((vals[2] << 6) | vals[3]);
         }
     }
     Ok(out)
@@ -184,7 +248,40 @@ pub struct ParsedQuery {
     pub payload: Vec<u8>,
 }
 
-pub fn decode_query(msg: Bytes, zone: &str) -> Result<ParsedQuery> {
+pub struct ParsedQuestion {
+    pub txid: u16,
+    pub qname_raw: Bytes,
+    pub qtype: u16,
+    pub labels: Vec<Vec<u8>>,
+}
+
+pub enum ParsedPacket {
+    Tunnel(ParsedQuery),
+    Question(ParsedQuestion),
+}
+
+pub fn decode_packet(msg: Bytes, zone: &str) -> Result<ParsedPacket> {
+    let q = decode_question(msg)?;
+    if q.qtype == QTYPE_TXT {
+        match labels_to_payload(&q.labels, zone) {
+            Ok(payload) => {
+                return Ok(ParsedPacket::Tunnel(ParsedQuery {
+                    txid: q.txid,
+                    qname_raw: q.qname_raw,
+                    qtype: q.qtype,
+                    payload,
+                }));
+            }
+            Err(e) if labels_under_zone(&q.labels, zone) => {
+                tracing::debug!(error=%e, "TXT question under zone did not carry tunnel payload");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(ParsedPacket::Question(q))
+}
+
+fn decode_question(msg: Bytes) -> Result<ParsedQuestion> {
     let start = msg.clone();
     let mut cur = msg;
     let txid = read_u16(&mut cur)?;
@@ -208,14 +305,21 @@ pub fn decode_query(msg: Bytes, zone: &str) -> Result<ParsedQuery> {
     let qtype = read_u16(&mut cur)?;
     let _qclass = read_u16(&mut cur)?;
 
-    let payload = labels_to_payload(&labels, zone)?;
     let qname_raw = start.slice(12..end_off);
-    Ok(ParsedQuery {
+    Ok(ParsedQuestion {
         txid,
         qname_raw,
         qtype,
-        payload,
+        labels,
     })
+}
+
+pub fn question_under_zone(q: &ParsedQuestion, zone: &str) -> bool {
+    labels_under_zone(&q.labels, zone)
+}
+
+pub fn question_is_zone_apex(q: &ParsedQuestion, zone: &str) -> bool {
+    labels_match_zone(&q.labels, zone)
 }
 
 fn labels_to_payload(labels: &[Vec<u8>], zone: &str) -> Result<Vec<u8>> {
@@ -240,8 +344,30 @@ fn labels_to_payload(labels: &[Vec<u8>], zone: &str) -> Result<Vec<u8>> {
     Ok(raw[2..].to_vec())
 }
 
-/// Encode a TXT response carrying `payload` bytes in concatenated
-/// character-strings. `qname_raw` is the wire-format question QNAME to echo.
+fn labels_under_zone(labels: &[Vec<u8>], zone: &str) -> bool {
+    let zone_labels: Vec<&str> = zone.split('.').filter(|s| !s.is_empty()).collect();
+    if labels.len() < zone_labels.len() {
+        return false;
+    }
+    let split = labels.len() - zone_labels.len();
+    labels[split..]
+        .iter()
+        .zip(zone_labels.iter())
+        .all(|(got, want)| got.eq_ignore_ascii_case(want.as_bytes()))
+}
+
+fn labels_match_zone(labels: &[Vec<u8>], zone: &str) -> bool {
+    let zone_labels: Vec<&str> = zone.split('.').filter(|s| !s.is_empty()).collect();
+    labels.len() == zone_labels.len()
+        && labels
+            .iter()
+            .zip(zone_labels.iter())
+            .all(|(got, want)| got.eq_ignore_ascii_case(want.as_bytes()))
+}
+
+/// Encode a TXT response carrying `payload` bytes as printable base64 split
+/// into TXT character-strings. `qname_raw` is the wire-format question QNAME
+/// to echo.
 pub fn encode_response(txid: u16, qname_raw: &[u8], qtype: u16, payload: &[u8]) -> Result<Bytes> {
     if payload.len() > MAX_RESPONSE_PAYLOAD {
         bail!(
@@ -250,7 +376,8 @@ pub fn encode_response(txid: u16, qname_raw: &[u8], qtype: u16, payload: &[u8]) 
             MAX_RESPONSE_PAYLOAD
         );
     }
-    let mut buf = BytesMut::with_capacity(64 + payload.len() + qname_raw.len());
+    let encoded = b64_encode(payload);
+    let mut buf = BytesMut::with_capacity(64 + encoded.len() + qname_raw.len());
     buf.put_u16(txid);
     buf.put_u16(FLAGS_RESPONSE);
     buf.put_u16(1); // QDCOUNT
@@ -269,23 +396,23 @@ pub fn encode_response(txid: u16, qname_raw: &[u8], qtype: u16, payload: &[u8]) 
     buf.put_u16(CLASS_IN);
     buf.put_u32(0); // TTL = 0 (no caching)
 
-    // RDATA = sequence of <u8 len><len bytes>
-    let chunks = payload.chunks(255);
-    let strings = if payload.is_empty() {
+    // RDATA = sequence of printable <u8 len><len bytes> strings.
+    let chunks = encoded.chunks(255);
+    let strings = if encoded.is_empty() {
         1
     } else {
         chunks.clone().count()
     };
-    let rdlen = if payload.is_empty() {
+    let rdlen = if encoded.is_empty() {
         1 // single empty character-string
     } else {
-        payload.len() + strings
+        encoded.len() + strings
     };
     if rdlen > u16::MAX as usize {
         bail!("response RDATA too large");
     }
     buf.put_u16(rdlen as u16);
-    if payload.is_empty() {
+    if encoded.is_empty() {
         buf.put_u8(0);
     } else {
         for chunk in chunks {
@@ -333,7 +460,58 @@ pub fn decode_response(msg: Bytes) -> Result<(u16, Vec<u8>)> {
         }
         out.extend_from_slice(&rd.split_to(l));
     }
-    Ok((txid, out))
+    Ok((txid, b64_decode(&out)?))
+}
+
+pub fn encode_ns_response(txid: u16, qname_raw: &[u8], zone: &str) -> Result<Bytes> {
+    let ns_name = format!("ns.{}", zone.trim_end_matches('.'));
+    let mut rdata = BytesMut::new();
+    write_plain_qname(&mut rdata, &ns_name)?;
+    encode_response_with_answer(txid, qname_raw, QTYPE_NS, QTYPE_NS, 300, &rdata)
+}
+
+pub fn encode_empty_noerror(txid: u16, qname_raw: &[u8], qtype: u16) -> Result<Bytes> {
+    let mut buf = BytesMut::with_capacity(32 + qname_raw.len());
+    buf.put_u16(txid);
+    buf.put_u16(FLAGS_RESPONSE);
+    buf.put_u16(1);
+    buf.put_u16(0);
+    buf.put_u16(0);
+    buf.put_u16(0);
+    buf.put_slice(qname_raw);
+    buf.put_u16(qtype);
+    buf.put_u16(CLASS_IN);
+    Ok(buf.freeze())
+}
+
+fn encode_response_with_answer(
+    txid: u16,
+    qname_raw: &[u8],
+    qtype: u16,
+    atype: u16,
+    ttl: u32,
+    rdata: &[u8],
+) -> Result<Bytes> {
+    if rdata.len() > u16::MAX as usize {
+        bail!("RDATA too large");
+    }
+    let mut buf = BytesMut::with_capacity(64 + qname_raw.len() + rdata.len());
+    buf.put_u16(txid);
+    buf.put_u16(FLAGS_RESPONSE);
+    buf.put_u16(1);
+    buf.put_u16(1);
+    buf.put_u16(0);
+    buf.put_u16(0);
+    buf.put_slice(qname_raw);
+    buf.put_u16(qtype);
+    buf.put_u16(CLASS_IN);
+    buf.put_u16(0xC00C);
+    buf.put_u16(atype);
+    buf.put_u16(CLASS_IN);
+    buf.put_u32(ttl);
+    buf.put_u16(rdata.len() as u16);
+    buf.put_slice(rdata);
+    Ok(buf.freeze())
 }
 
 fn write_qname_with_payload(buf: &mut BytesMut, b32: &str, zone: &str) -> Result<()> {
@@ -360,6 +538,25 @@ fn write_qname_with_payload(buf: &mut BytesMut, b32: &str, zone: &str) -> Result
     written_octets += 1;
     if written_octets > MAX_NAME_OCTETS {
         bail!("qname {written_octets} exceeds 255 octets");
+    }
+    Ok(())
+}
+
+fn write_plain_qname(buf: &mut BytesMut, name: &str) -> Result<()> {
+    let mut written_octets = 0usize;
+    for label in name.split('.').filter(|s| !s.is_empty()) {
+        let lb = label.as_bytes();
+        if lb.is_empty() || lb.len() > MAX_LABEL_BYTES {
+            bail!("invalid name label {label:?}");
+        }
+        buf.put_u8(lb.len() as u8);
+        buf.put_slice(lb);
+        written_octets += 1 + lb.len();
+    }
+    buf.put_u8(0);
+    written_octets += 1;
+    if written_octets > MAX_NAME_OCTETS {
+        bail!("name {written_octets} exceeds 255 octets");
     }
     Ok(())
 }
@@ -472,6 +669,24 @@ mod tests {
     }
 
     #[test]
+    fn b64_roundtrip() {
+        for input in [
+            b"".to_vec(),
+            b"a".to_vec(),
+            b"ab".to_vec(),
+            b"abc".to_vec(),
+            (0..200u8).collect::<Vec<_>>(),
+        ] {
+            let enc = b64_encode(&input);
+            assert!(enc
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')));
+            let dec = b64_decode(&enc).unwrap();
+            assert_eq!(dec, input);
+        }
+    }
+
+    #[test]
     fn query_capacity_reasonable() {
         let cap = query_capacity("t.example.com");
         // With a 15-octet zone we expect somewhere between 100 and 160 raw
@@ -487,7 +702,10 @@ mod tests {
             .map(|i| (i & 0xff) as u8)
             .collect();
         let msg = encode_query(0x1234, zone, &payload).unwrap();
-        let parsed = decode_query(msg, zone).unwrap();
+        let parsed = match decode_packet(msg, zone).unwrap() {
+            ParsedPacket::Tunnel(q) => q,
+            ParsedPacket::Question(_) => panic!("expected tunnel query"),
+        };
         assert_eq!(parsed.txid, 0x1234);
         assert_eq!(parsed.qtype, QTYPE_TXT);
         assert_eq!(parsed.payload, payload);
@@ -497,7 +715,10 @@ mod tests {
     fn query_empty_round_trip() {
         let zone = "t.example.com";
         let msg = encode_query(0xBEEF, zone, &[]).unwrap();
-        let parsed = decode_query(msg, zone).unwrap();
+        let parsed = match decode_packet(msg, zone).unwrap() {
+            ParsedPacket::Tunnel(q) => q,
+            ParsedPacket::Question(_) => panic!("expected tunnel query"),
+        };
         assert_eq!(parsed.txid, 0xBEEF);
         assert!(parsed.payload.is_empty());
     }
@@ -509,6 +730,9 @@ mod tests {
             .map(|i| (i.wrapping_mul(7) & 0xff) as u8)
             .collect();
         let msg = encode_response(0x4242, qname, QTYPE_TXT, &payload).unwrap();
+        assert!(msg
+            .windows(1)
+            .any(|b| b[0].is_ascii_alphanumeric() || matches!(b[0], b'+' | b'/' | b'=')));
         let (txid, body) = decode_response(msg).unwrap();
         assert_eq!(txid, 0x4242);
         assert_eq!(body, payload);
@@ -528,5 +752,17 @@ mod tests {
         let zone = "t.example.com";
         let too_big = vec![0u8; query_capacity(zone) + 1];
         assert!(encode_query(0, zone, &too_big).is_err());
+    }
+
+    #[test]
+    fn ns_probe_response_is_valid_question_response() {
+        let qname = b"\x01t\x07example\x03com\x00";
+        let msg = encode_ns_response(0xCAFE, qname, "t.example.com").unwrap();
+        let mut cur = msg;
+        assert_eq!(read_u16(&mut cur).unwrap(), 0xCAFE);
+        let flags = read_u16(&mut cur).unwrap();
+        assert_ne!(flags & 0x8000, 0);
+        assert_eq!(read_u16(&mut cur).unwrap(), 1);
+        assert_eq!(read_u16(&mut cur).unwrap(), 1);
     }
 }

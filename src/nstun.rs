@@ -1,26 +1,27 @@
 //! NS-tunnel transport: client → public recursive resolver → our authoritative
-//! NS → client. Standard plaintext UDP/53 DNS messages. The recursive resolver
-//! is the visible peer on both ends — no direct flow between client and server
-//! exists at the network layer.
+//! NS → client. Standard DNS messages. The recursive resolver is the visible
+//! peer on both ends — no direct flow between client and server exists at the
+//! network layer.
 //!
-//! Client-side multi-path: each query independently picks from a pool of
-//! recursive resolvers, so concurrent tunnel sessions are sprayed across
-//! distinct (client→resolver) flows. The cache-buster nonce embedded in
+//! Client-side multi-path: each query advances through the resolver pool, so
+//! long byte streams are chunk-striped across resolvers instead of relying on
+//! per-query randomness. The cache-buster nonce embedded in
 //! `nstun_codec::encode_query` ensures resolvers always re-fetch from us.
 //!
 //! Server-side: one UDP listener, per-query session lookup. Sessions are
 //! keyed by the 64-bit Frame.session ID just like the DoQ path. Upstream
 //! TCP fan-out and downstream poll-hold mirror `server::handle_stream`.
 
-use crate::cli::Config;
+use crate::cli::{Config, NsResolverTransport};
 use crate::nstun_codec::{self, query_capacity, MAX_RESPONSE_PAYLOAD};
 use crate::protocol::{Frame, FLAG_CLOSE, FLAG_OPEN, HEADER_LEN};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
-use rand::seq::SliceRandom;
+use quinn::{ClientConfig, Endpoint};
 use rand::Rng;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -92,7 +93,25 @@ async fn handle_packet(
     cfg: Arc<Config>,
     sessions: Sessions,
 ) -> Result<()> {
-    let parsed = nstun_codec::decode_query(pkt, zone)?;
+    let parsed = match nstun_codec::decode_packet(pkt, zone)? {
+        nstun_codec::ParsedPacket::Tunnel(q) => q,
+        nstun_codec::ParsedPacket::Question(q) => {
+            if !nstun_codec::question_under_zone(&q, zone) {
+                bail!("question outside zone");
+            }
+            let msg = if q.qtype == nstun_codec::QTYPE_NS
+                && nstun_codec::question_is_zone_apex(&q, zone)
+            {
+                nstun_codec::encode_ns_response(q.txid, &q.qname_raw, zone)?
+            } else {
+                nstun_codec::encode_empty_noerror(q.txid, &q.qname_raw, q.qtype)?
+            };
+            sock.send_to(&msg, peer)
+                .await
+                .context("send_to probe response")?;
+            return Ok(());
+        }
+    };
     let frame = Frame::decode(&parsed.payload)?;
     let session_id = frame.session;
     let seq = frame.seq;
@@ -217,7 +236,8 @@ pub async fn run_client(cfg: Config) -> Result<()> {
     tracing::info!("ns-tunnel client listening on {}", cfg.local);
 
     let zone = Arc::new(zone);
-    let resolved = Arc::new(resolved);
+    let resolved = Arc::new(ResolverPool::new(resolved));
+    let resolver_transport = cfg.ns_resolver_transport;
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -229,14 +249,21 @@ pub async fn run_client(cfg: Config) -> Result<()> {
         let zone = zone.clone();
         let resolved = resolved.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client_conn(tcp, peer, zone, resolved).await {
+            if let Err(e) = handle_client_conn(tcp, peer, zone, resolved, resolver_transport).await
+            {
                 tracing::debug!(error=%e, %peer, "ns-tunnel: connection ended");
             }
         });
     }
 }
 
-async fn resolve_all(specs: &[(String, u16)]) -> Result<Vec<SocketAddr>> {
+#[derive(Debug, Clone)]
+struct ResolvedResolver {
+    sni: String,
+    addr: SocketAddr,
+}
+
+async fn resolve_all(specs: &[(String, u16)]) -> Result<Vec<ResolvedResolver>> {
     let mut out = Vec::new();
     for (host, port) in specs {
         use std::net::ToSocketAddrs;
@@ -244,7 +271,10 @@ async fn resolve_all(specs: &[(String, u16)]) -> Result<Vec<SocketAddr>> {
             .to_socket_addrs()
             .with_context(|| format!("resolving {host}:{port}"))?;
         for a in addrs {
-            out.push(a);
+            out.push(ResolvedResolver {
+                sni: host.clone(),
+                addr: a,
+            });
         }
     }
     Ok(out)
@@ -254,7 +284,8 @@ async fn handle_client_conn(
     mut tcp: TcpStream,
     peer: SocketAddr,
     zone: Arc<String>,
-    resolvers: Arc<Vec<SocketAddr>>,
+    resolvers: Arc<ResolverPool>,
+    resolver_transport: NsResolverTransport,
 ) -> Result<()> {
     tcp.set_nodelay(true).ok();
     let session: u64 = rand::random();
@@ -314,7 +345,7 @@ async fn handle_client_conn(
         };
         seq = seq.wrapping_add(1);
 
-        let resp_frame = match round_trip(&zone, &resolvers, &frame).await {
+        let resp_frame = match round_trip(&zone, &resolvers, resolver_transport, &frame).await {
             Ok(f) => f,
             Err(e) => {
                 tracing::debug!(error=%e, %peer, session, "round-trip failed; tearing down");
@@ -344,17 +375,58 @@ async fn handle_client_conn(
     Ok(())
 }
 
-async fn round_trip(zone: &str, resolvers: &[SocketAddr], frame: &Frame) -> Result<Frame> {
+struct ResolverPool {
+    addrs: Vec<ResolvedResolver>,
+    next: AtomicUsize,
+}
+
+impl ResolverPool {
+    fn new(addrs: Vec<ResolvedResolver>) -> Self {
+        Self {
+            addrs,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    fn next(&self) -> ResolvedResolver {
+        let idx = self.next.fetch_add(1, Ordering::Relaxed);
+        self.addrs[idx % self.addrs.len()].clone()
+    }
+}
+
+async fn round_trip(
+    zone: &str,
+    resolvers: &ResolverPool,
+    resolver_transport: NsResolverTransport,
+    frame: &Frame,
+) -> Result<Frame> {
     let frame_bytes = frame.encode_vec();
     let mut last_err: Option<anyhow::Error> = None;
     for _ in 0..CLIENT_MAX_ATTEMPTS {
-        let resolver = {
-            let mut rng = rand::thread_rng();
-            *resolvers.choose(&mut rng).unwrap()
+        let resolver = resolvers.next();
+        let txid: u16 = match resolver_transport {
+            NsResolverTransport::Udp => rand::thread_rng().gen(),
+            NsResolverTransport::Doq => 0,
         };
-        let txid: u16 = rand::thread_rng().gen();
         let query = nstun_codec::encode_query(txid, zone, &frame_bytes)?;
-        let bind: SocketAddr = if resolver.is_ipv6() {
+        if resolver_transport == NsResolverTransport::Doq {
+            match send_doq(&resolver, &query).await {
+                Ok(pkt) => match nstun_codec::decode_response(pkt) {
+                    Ok((got_txid, body)) if got_txid == txid => {
+                        let resp = Frame::decode(&body)?;
+                        return Ok(resp);
+                    }
+                    Ok((got_txid, _)) => {
+                        last_err = Some(anyhow!("txid mismatch want={txid} got={got_txid}"));
+                    }
+                    Err(e) => last_err = Some(e),
+                },
+                Err(e) => last_err = Some(e),
+            }
+            continue;
+        }
+        let resolver_addr = resolver.addr;
+        let bind: SocketAddr = if resolver_addr.is_ipv6() {
             (Ipv6Addr::UNSPECIFIED, 0).into()
         } else {
             (Ipv4Addr::UNSPECIFIED, 0).into()
@@ -366,7 +438,7 @@ async fn round_trip(zone: &str, resolvers: &[SocketAddr], frame: &Frame) -> Resu
                 continue;
             }
         };
-        if let Err(e) = sock.connect(resolver).await {
+        if let Err(e) = sock.connect(resolver_addr).await {
             last_err = Some(e.into());
             continue;
         }
@@ -396,11 +468,42 @@ async fn round_trip(zone: &str, resolvers: &[SocketAddr], frame: &Frame) -> Resu
             }
             Ok(Err(e)) => last_err = Some(e.into()),
             Err(_) => {
-                last_err = Some(anyhow!("query timeout to {resolver}"));
+                last_err = Some(anyhow!("query timeout to {resolver_addr}"));
             }
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("ns round-trip exhausted attempts")))
+}
+
+async fn send_doq(resolver: &ResolvedResolver, query: &[u8]) -> Result<Bytes> {
+    let bind: SocketAddr = if resolver.addr.is_ipv6() {
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    let mut endpoint = Endpoint::client(bind).context("creating DoQ endpoint")?;
+    let crypto = crate::tls::client_config(false)?;
+    let qcfg: quinn::crypto::rustls::QuicClientConfig = crypto
+        .try_into()
+        .map_err(|e| anyhow!("rustls→quic client config: {e}"))?;
+    endpoint.set_default_client_config(ClientConfig::new(Arc::new(qcfg)));
+    let conn = endpoint
+        .connect(resolver.addr, &resolver.sni)
+        .with_context(|| format!("DoQ connect setup to {}", resolver.addr))?
+        .await
+        .with_context(|| format!("DoQ handshake with {}", resolver.sni))?;
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
+    send.write_u16(query.len() as u16).await?;
+    send.write_all(query).await?;
+    send.finish().ok();
+    let len = recv.read_u16().await? as usize;
+    if len > 64 * 1024 {
+        bail!("absurd DoQ response length {len}");
+    }
+    let mut buf = vec![0u8; len];
+    recv.read_exact(&mut buf).await?;
+    conn.close(0u32.into(), b"done");
+    Ok(Bytes::from(buf))
 }
 
 // ============================================================================
@@ -410,7 +513,7 @@ async fn round_trip(zone: &str, resolvers: &[SocketAddr], frame: &Frame) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{Mode, Transport};
+    use crate::cli::{Mode, NsResolverTransport, Transport};
 
     fn cfg_template() -> Config {
         Config {
@@ -426,6 +529,7 @@ mod tests {
             decoy: None,
             ns_zone: Some("t.example.com".into()),
             ns_resolvers: None,
+            ns_resolver_transport: NsResolverTransport::Udp,
             ns_bind: None,
         }
     }

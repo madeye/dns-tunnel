@@ -18,6 +18,12 @@ pub enum Transport {
     Ns,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NsResolverTransport {
+    Udp,
+    Doq,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub mode: Mode,
@@ -35,6 +41,8 @@ pub struct Config {
     pub ns_zone: Option<String>,
     /// NS-tunnel client: recursive resolver pool (host:port).
     pub ns_resolvers: Option<Vec<(String, u16)>>,
+    /// NS-tunnel client: client-to-recursive-resolver transport.
+    pub ns_resolver_transport: NsResolverTransport,
     /// NS-tunnel server: UDP bind address (defaults to `remote`).
     pub ns_bind: Option<SocketAddr>,
 }
@@ -89,7 +97,8 @@ impl Config {
     ///   decoy-domains=       (client only; comma-separated A-record query targets)
     ///   transport=quic|ns    (default: quic; ns = authoritative-NS tunnel through recursive resolvers)
     ///   ns-zone=<zone>       (transport=ns; delegated zone, e.g. t.example.com)
-    ///   ns-resolvers=        (transport=ns client; host:port,...; default 1.1.1.1:53,8.8.8.8:53,9.9.9.9:53)
+    ///   ns-resolvers=        (transport=ns client; host:port,...; default SS_REMOTE_HOST:SS_REMOTE_PORT for UDP)
+    ///   ns-resolver-transport=udp|doq (transport=ns client; default udp)
     ///   ns-bind=host:port    (transport=ns server; UDP bind; default = SS_REMOTE_HOST:SS_REMOTE_PORT)
     pub fn from_env_and_args() -> Result<Self> {
         let remote_host = env_required("SS_REMOTE_HOST")?;
@@ -116,7 +125,7 @@ impl Config {
 
         let remote = resolve(&remote_host, remote_port)?;
         let local = resolve(&local_host, local_port)?;
-        let sni = opts.get("sni").cloned().unwrap_or(remote_host);
+        let sni = opts.get("sni").cloned().unwrap_or(remote_host.clone());
         let insecure = opts.contains_key("insecure");
         let cert = opts.get("cert").map(PathBuf::from);
         let key = opts.get("key").map(PathBuf::from);
@@ -210,11 +219,25 @@ impl Config {
         };
 
         let ns_zone = opts.get("ns-zone").cloned();
+        let ns_resolver_transport = match opts
+            .get("ns-resolver-transport")
+            .map(String::as_str)
+            .unwrap_or("udp")
+        {
+            "udp" => NsResolverTransport::Udp,
+            "doq" => NsResolverTransport::Doq,
+            other => bail!("invalid ns-resolver-transport={other}, expected udp or doq"),
+        };
         let ns_resolvers = if mode == Mode::Client && transport == Transport::Ns {
-            let raw = opts
-                .get("ns-resolvers")
-                .cloned()
-                .unwrap_or_else(|| "1.1.1.1:53,8.8.8.8:53,9.9.9.9:53".into());
+            let raw = match opts.get("ns-resolvers") {
+                Some(raw) => raw.clone(),
+                None if ns_resolver_transport == NsResolverTransport::Udp => {
+                    format!("{remote_host}:{remote_port}")
+                }
+                None => bail!(
+                    "transport=ns with ns-resolver-transport=doq requires ns-resolvers=<host:port,...>"
+                ),
+            };
             Some(
                 raw.split(',')
                     .map(str::trim)
@@ -251,6 +274,7 @@ impl Config {
             decoy,
             ns_zone,
             ns_resolvers,
+            ns_resolver_transport,
             ns_bind,
         })
     }
